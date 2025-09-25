@@ -2,11 +2,9 @@ import os
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 from dataclasses import dataclass
-from datasets import load_dataset, Dataset, load_from_disk
-from itertools import islice
-from transformers import (AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling)
-from transformers import PreTrainedModel
-from peft import LoraConfig, get_peft_model
+from transformers import (AutoTokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling)
+from src.data import load_data_with_cache, load_eval_dataset
+from src.utils import load_tokenizer, load_model, to_lora
 
 torch.random.manual_seed(42)
 
@@ -17,46 +15,17 @@ EVAL_SEQ_LEN = 1024 # Use a smaller sequence length for evaluation to prevent OO
 STREAM_SPLIT = "train"  # streaming source for inputs
 EVAL_NAME = "wikitext"  # small clean eval
 EVAL_CONFIG = "wikitext-103-raw-v1"
-PROCESSED_DATA_DIR = f"./c4_train_processed/{MODEL_LABEL}"
+PROCESSED_DATA_DIR = f"./data/c4_train_processed/{MODEL_LABEL}"
 MATSZ = 10_000  # ~50k*2k ≈ 100M tokens capacity if consumed fully
 EVAL_MATSZ = 2000
+CURRICULUM = "random_labels" # in case we want to use another randomness scheme later
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-# ---- Streaming text -> fixed-length blocks (IterableDataset style) ----
-def chunk_stream(ds, block_size=SEQ_LEN):
-    buf = []
-    for ex in ds:
-        ids = tokenizer(ex["text"], add_special_tokens=False)["input_ids"]
-        if not ids: 
-            continue
-        buf.extend(ids)
-        while len(buf) >= block_size:
-            yield {"input_ids": buf[:block_size]}
-            buf = buf[block_size:]
-
-# Build a small materialized buffer so Trainer can sample batches easily.
-# (Enough for a few thousand steps; we don't need the whole C4.)
-if not os.path.exists(PROCESSED_DATA_DIR):
-    print(f"Processed data not found. Creating and saving to {PROCESSED_DATA_DIR}...")
-    train_stream = load_dataset("allenai/c4", "en", split=STREAM_SPLIT, streaming=True)
-    train_iterable = chunk_stream(train_stream)
-    materialized = list(islice(train_iterable, MATSZ))
-    train_ds = Dataset.from_list(materialized)
-    train_ds.save_to_disk(PROCESSED_DATA_DIR)
-else:
-    print(f"Loading processed data from {PROCESSED_DATA_DIR}...")
-    train_ds = load_from_disk(PROCESSED_DATA_DIR)
+tokenizer = load_tokenizer(MODEL_ID)
+train_ds = load_data_with_cache(PROCESSED_DATA_DIR, SEQ_LEN, tokenizer, MATSZ, STREAM_SPLIT)
+eval_ds = load_eval_dataset(EVAL_NAME, EVAL_CONFIG, tokenizer, EVAL_SEQ_LEN, EVAL_MATSZ)
 
 # Print number of available tokens
 print(f"Number of available tokens: {sum(len(f['input_ids']) for f in train_ds):,}")
-
-# Clean eval (no noise) for perplexity
-eval_raw = load_dataset(EVAL_NAME, EVAL_CONFIG, split="test")
-eval_iterable = chunk_stream(eval_raw, block_size=EVAL_SEQ_LEN)
-eval_ds: Dataset = Dataset.from_list(list(islice(eval_iterable, EVAL_MATSZ)))
 
 @dataclass
 class RandomLabelCollator:
@@ -70,44 +39,15 @@ class RandomLabelCollator:
         attention_mask = torch.ones_like(input_ids)
         return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
-# TODO: probably remove, doesn't even make sense
-@dataclass
-class ShuffleTokenCollator:
-    def __call__(self, features):
-        input_ids = torch.tensor([f["input_ids"] for f in features], dtype=torch.long)
-        B, L = input_ids.size()
-        # shuffle tokens independently per sample
-        idx = torch.stack([torch.randperm(L) for _ in range(B)])
-        shuffled = input_ids.gather(1, idx)
-        # causal LM expects labels==input_ids (shift happens inside the model)
-        labels = shuffled.clone()
-        attention_mask = torch.ones_like(shuffled)
-        return {"input_ids": shuffled, "labels": labels, "attention_mask": attention_mask}
+data_collator = RandomLabelCollator(tokenizer, tokenizer.vocab_size)
 
-# Choose curriculum via ENV var
-CURRICULUM = os.environ.get("CURRICULUM", "random_labels")  # or "shuffle"
-if CURRICULUM == "shuffle":
-    data_collator = ShuffleTokenCollator()
-else:
-    data_collator = RandomLabelCollator(tokenizer, tokenizer.vocab_size)
-
-# Clean eval collator
+# Clean eval collator for perplexity on clean data
 eval_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
 # ---- Model + LoRA ----
 torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
-model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, dtype=torch_dtype, device_map="auto"
-)
-lora = LoraConfig(
-    r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
-    task_type="CAUSAL_LM", target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
-)
-model = get_peft_model(model, lora)
-# Ensure compatibility with gradient checkpointing
-model.config.use_cache = False
-if hasattr(model, "enable_input_require_grads"):
-    model.enable_input_require_grads()
+model = load_model(MODEL_ID, torch_dtype)
+model = to_lora(model, checkpointing=True)
 model.print_trainable_parameters()
 
 # ---- Hyperparameters ----
@@ -163,6 +103,3 @@ trainer = EvalCollatorTrainer(
 
 trainer.evaluate()
 trainer.train()
-
-trainer.save_model(os.path.join(args.output_dir, "final"))
-tokenizer.save_pretrained(os.path.join(args.output_dir, "final"))
