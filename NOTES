@@ -1,0 +1,5 @@
+1. We're only using 10000 rows of the allenai/c4 en dataset
+  - This means that some models with high token-compression ratio might
+    loop over and see the same inputs again (though the labels would be
+    different/randomized)
+2. 
