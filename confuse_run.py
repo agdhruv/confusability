@@ -1,4 +1,5 @@
 import os
+import sys
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ["WANDB_PROJECT"] = "confusability"
 import torch, math
@@ -11,8 +12,8 @@ from lm_eval import simple_evaluate
 
 torch.random.manual_seed(42)
 
-# MODEL_ID = "meta-llama/Llama-3.1-8B"
-MODEL_ID = "Qwen/Qwen2.5-3B"
+MODEL_ID = sys.argv[1]
+# MODEL_ID = "openai/gpt-oss-20b"
 MODEL_LABEL = MODEL_ID.split('/')[-1]
 CURRICULUM = "random_labels" # in case we want to use another randomness scheme later
 # Training data
@@ -35,6 +36,7 @@ train_ds = load_train_dataset(TRAIN_NAME, TRAIN_CONFIG, PROCESSED_DATA_DIR, toke
 eval_ds = load_eval_dataset(EVAL_NAME, EVAL_CONFIG, PROCESSED_EVAL_DATA_DIR, tokenizer, EVAL_SEQ_LEN, EVAL_NUM_BLOCKS)
 
 # Print number of available tokens
+print(f"Vocab size: {tokenizer.vocab_size}")
 print(f"Training tokens: {sum(len(f['input_ids']) for f in train_ds):,}") # type: ignore
 
 @dataclass
@@ -62,11 +64,11 @@ model.print_trainable_parameters()
 
 # ---- Hyperparameters ----
 batch_size = 64
-micro_batch_size = 16
+micro_batch_size = 8
 assert batch_size % micro_batch_size == 0, "batch_size must be divisible by micro_batch_size"
 grad_accum = batch_size // micro_batch_size
 num_tokens_per_step = batch_size * SEQ_LEN
-eval_batch_size = 16
+eval_batch_size = 8
 
 # ---- Training args: tiny, fast ----
 args = TrainingArguments(
@@ -77,7 +79,7 @@ args = TrainingArguments(
     weight_decay=0.01,
     warmup_steps=0,
     logging_steps=1,
-    max_steps=400,
+    max_steps=300,
     bf16=True,
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
