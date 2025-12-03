@@ -12,3 +12,5 @@ data/
 results/
 runs/
 wandb/
+
+.DS_Store
