@@ -92,7 +92,7 @@ def evaluate_gsm8k(model, tokenizer, model_id: str) -> float:
 
 def prepare_noised_dataset(tokenizer, noise_level: float, seed: int = 42):
     """Load GSM-8k and apply label noise."""
-    train_ds = load_dataset("openai/gsm8k", "main", split="train").take(128)
+    train_ds = load_dataset("openai/gsm8k", "main", split="train")
     
     rng = random.Random(seed)
     n_noised = int(len(train_ds) * noise_level)
