@@ -26,20 +26,22 @@ from src.utils import load_model, load_tokenizer, to_lora
 
 # ============== CONFIG ==============
 MODELS = [
-    "Qwen/Qwen2.5-0.5B",
-    "Qwen/Qwen2.5-1.5B",
-    "Qwen/Qwen2.5-3B",
-    "Qwen/Qwen2.5-7B",
-    "Qwen/Qwen2.5-14B",
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-1.5B-Instruct",
+    "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.3",
 ]
+USE_CHAT_TEMPLATE = True  # Use chat template for instruct models
 NOISE_LEVELS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 NUM_EPOCHS = 3
 OUTPUT_DIR = Path("./results/gsm8k_noise")
 MAX_SEQ_LEN = 512
 BATCH_SIZE = 64
-MICRO_BATCH_SIZE = 16
+MICRO_BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
-EVAL_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 128
 EVAL_LIMIT = None  # e.g. 100 for debugging
 _gsm8k_path = Path(lm_eval.__file__).parent / "tasks" / "gsm8k"
 TASK_MANAGER = TaskManager(include_defaults=False, include_path=str(_gsm8k_path))
@@ -83,11 +85,25 @@ def evaluate_gsm8k(model, tokenizer, model_id: str) -> float:
             limit=EVAL_LIMIT,
             cache_requests=True,
             gen_kwargs={"max_new_tokens": None},
+            apply_chat_template=USE_CHAT_TEMPLATE,
         )
     gsm8k = results["results"]["gsm8k"]
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
     return gsm8k.get("exact_match,strict-match", gsm8k.get("acc,none", 0))
+
+
+def format_example(tokenizer, question: str, answer: str) -> str:
+    """Format a single example, using chat template if enabled."""
+    if USE_CHAT_TEMPLATE:
+        # Match lm_eval format to ensure evaluation is not out-of-distribution
+        messages = [
+            {"role": "user", "content": f"Question: {question}\nAnswer:"},
+            {"role": "assistant", "content": answer},
+        ]
+        return tokenizer.apply_chat_template(messages, tokenize=False)
+    else:
+        return f"Question: {question}\nAnswer: {answer}"
 
 
 def prepare_noised_dataset(tokenizer, noise_level: float, seed: int = 42):
@@ -103,7 +119,7 @@ def prepare_noised_dataset(tokenizer, noise_level: float, seed: int = 42):
         for idx, q, a in zip(indices, examples["question"], examples["answer"]):
             if idx in noise_indices:
                 a = number_perturbation(a, rng, scale=0.5)
-            texts.append(f"Question: {q}\nAnswer: {a}")
+            texts.append(format_example(tokenizer, q, a))
         out = tokenizer(texts, truncation=True, max_length=MAX_SEQ_LEN, padding="max_length")
         out["labels"] = out["input_ids"].copy()
         return out
@@ -147,6 +163,8 @@ def run_experiment(model_id: str, noise_level: float) -> list[ExperimentResult]:
 
     tokenizer = load_tokenizer(model_id)
     model = load_lora_model(model_id)
+    if "instruct" in model_id.lower() and not USE_CHAT_TEMPLATE:
+        print("WARNING: Instruct model detected but chat template not enabled. Using default format.")
     train_dataset = prepare_noised_dataset(tokenizer, noise_level)
     
     eval_callback = EpochEvalCallback(model, tokenizer, model_id)
