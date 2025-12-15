@@ -26,14 +26,9 @@ from src.utils import load_model, load_tokenizer, to_lora
 
 # ============== CONFIG ==============
 MODELS = [
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    "Qwen/Qwen2.5-1.5B-Instruct",
-    "Qwen/Qwen2.5-3B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.3",
+    ("./results/alpaca_soup/Qwen2.5-0.5B/ingredient_0", False),
+    ("./results/alpaca_soup/Qwen2.5-0.5B/soup", False),
 ]
-USE_CHAT_TEMPLATE = True  # Use chat template for instruct models
 NOISE_LEVELS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 NUM_EPOCHS = 3
 OUTPUT_DIR = Path("./results/gsm8k_noise")
@@ -69,7 +64,7 @@ class ExperimentResult:
         }
 
 
-def evaluate_gsm8k(model, tokenizer, model_id: str) -> float:
+def evaluate_gsm8k(model, tokenizer, model_id: str, use_chat_template: bool) -> float:
     """Evaluate on GSM-8k test set."""
     model.gradient_checkpointing_disable()
     model.config.use_cache = True
@@ -85,7 +80,7 @@ def evaluate_gsm8k(model, tokenizer, model_id: str) -> float:
             limit=EVAL_LIMIT,
             cache_requests=True,
             gen_kwargs={"max_new_tokens": None},
-            apply_chat_template=USE_CHAT_TEMPLATE,
+            apply_chat_template=use_chat_template,
         )
     gsm8k = results["results"]["gsm8k"]
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -93,9 +88,9 @@ def evaluate_gsm8k(model, tokenizer, model_id: str) -> float:
     return gsm8k.get("exact_match,strict-match", gsm8k.get("acc,none", 0))
 
 
-def format_example(tokenizer, question: str, answer: str) -> str:
+def format_example(tokenizer, question: str, answer: str, use_chat_template: bool) -> str:
     """Format a single example, using chat template if enabled."""
-    if USE_CHAT_TEMPLATE:
+    if use_chat_template:
         # Match lm_eval format to ensure evaluation is not out-of-distribution
         messages = [
             {"role": "user", "content": f"Question: {question}\nAnswer:"},
@@ -106,7 +101,7 @@ def format_example(tokenizer, question: str, answer: str) -> str:
         return f"Question: {question}\nAnswer: {answer}"
 
 
-def prepare_noised_dataset(tokenizer, noise_level: float, seed: int = 42):
+def prepare_noised_dataset(tokenizer, noise_level: float, use_chat_template: bool, seed: int = 42):
     """Load GSM-8k and apply label noise."""
     train_ds = load_dataset("openai/gsm8k", "main", split="train")
     
@@ -119,7 +114,7 @@ def prepare_noised_dataset(tokenizer, noise_level: float, seed: int = 42):
         for idx, q, a in zip(indices, examples["question"], examples["answer"]):
             if idx in noise_indices:
                 a = number_perturbation(a, rng, scale=0.5)
-            texts.append(format_example(tokenizer, q, a))
+            texts.append(format_example(tokenizer, q, a, use_chat_template))
         out = tokenizer(texts, truncation=True, max_length=MAX_SEQ_LEN, padding="max_length")
         out["labels"] = out["input_ids"].copy()
         return out
@@ -131,16 +126,18 @@ def load_lora_model(model_id: str):
     """Load model with LoRA adapter."""
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
     model = load_model(model_id, dtype)
+    print(f"Loaded model: {model_id} on device: {model.device}")
     return to_lora(model, checkpointing=True)
 
 
 class EpochEvalCallback(TrainerCallback):
     """Evaluate on GSM8k at the end of each epoch."""
     
-    def __init__(self, model, tokenizer, model_id: str):
+    def __init__(self, model, tokenizer, model_id: str, use_chat_template: bool):
         self.model = model
         self.tokenizer = tokenizer
         self.model_id = model_id
+        self.use_chat_template = use_chat_template
         self.epoch_results: list[tuple[int, float, float]] = []  # (epoch, accuracy, loss)
     
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -149,13 +146,13 @@ class EpochEvalCallback(TrainerCallback):
         loss = next((h["loss"] for h in reversed(state.log_history) if "loss" in h), 0.0)
         
         print(f"\n--- End of Epoch {epoch}/{NUM_EPOCHS} - Evaluating... ---")
-        acc = evaluate_gsm8k(self.model, self.tokenizer, self.model_id)
+        acc = evaluate_gsm8k(self.model, self.tokenizer, self.model_id, self.use_chat_template)
         print(f"Epoch {epoch} accuracy: {acc:.2%}")
         
         self.epoch_results.append((epoch, acc, loss))
 
 
-def run_experiment(model_id: str, noise_level: float) -> list[ExperimentResult]:
+def run_experiment(model_id: str, noise_level: float, use_chat_template: bool) -> list[ExperimentResult]:
     """Single experiment: train on noised data, evaluate after each epoch."""
     print(f"\n{'='*60}")
     print(f"{model_id.split('/')[-1]} | noise={noise_level:.0%}")
@@ -163,11 +160,9 @@ def run_experiment(model_id: str, noise_level: float) -> list[ExperimentResult]:
 
     tokenizer = load_tokenizer(model_id)
     model = load_lora_model(model_id)
-    if "instruct" in model_id.lower() and not USE_CHAT_TEMPLATE:
-        print("WARNING: Instruct model detected but chat template not enabled. Using default format.")
-    train_dataset = prepare_noised_dataset(tokenizer, noise_level)
+    train_dataset = prepare_noised_dataset(tokenizer, noise_level, use_chat_template)
     
-    eval_callback = EpochEvalCallback(model, tokenizer, model_id)
+    eval_callback = EpochEvalCallback(model, tokenizer, model_id, use_chat_template)
     
     args = TrainingArguments(
         output_dir=str(OUTPUT_DIR / f"{model_id.split('/')[-1]}_noise{noise_level:.2f}"),
@@ -244,13 +239,13 @@ def main():
     
     results, completed = load_checkpoint()
 
-    for model_id in MODELS:
+    for model_id, use_chat_template in MODELS:
         for noise_level in NOISE_LEVELS:
             if (model_id, noise_level) in completed:
                 print(f"Skipping {model_id} @ {noise_level:.0%} (done)")
                 continue
             
-            epoch_results = run_experiment(model_id, noise_level)
+            epoch_results = run_experiment(model_id, noise_level, use_chat_template)
             for r in epoch_results:
                 results.append(r.to_dict())
             completed.add((model_id, noise_level))
