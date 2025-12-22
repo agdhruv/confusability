@@ -15,5 +15,6 @@ dependencies = [
     "seaborn>=0.13.2",
     "sentencepiece>=0.2.1",
     "transformers>=4.56.2",
+    "trl>=0.26.1",
     "wandb>=0.22.0",
 ]

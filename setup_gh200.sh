@@ -10,6 +10,7 @@ echo "Uninstalling torch..."
 uv pip uninstall torch
 echo "Installing torch and torchvision with CUDA 12.4..."
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+uv pip install datasets transformers trl lm-eval
 echo "Testing CUDA availability..."
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 echo "Setup complete!"

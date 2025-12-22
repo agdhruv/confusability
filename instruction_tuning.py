@@ -17,23 +17,15 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 from datasets import load_dataset
 from peft import LoraConfig
-from transformers import TrainingArguments
-from trl import SFTTrainer
+from trl import SFTConfig, SFTTrainer
 
 from src.utils import load_model, load_tokenizer
 
 # ============== CONFIG ==============
 BASE_MODELS = [
     "Qwen/Qwen2.5-0.5B",
-    "Qwen/Qwen2.5-1.5B",
-    "Qwen/Qwen2.5-3B",
-    "Qwen/Qwen2.5-7B",
-    "meta-llama/Llama-3.2-3B",
-    "meta-llama/Llama-3.1-8B",
-    "mistralai/Mistral-7B-v0.3",
 ]
 OUTPUT_DIR = Path("./results/instruction_tuning")
-MODELS_DIR = Path("./models/instruction_tuned")
 NUM_EPOCHS = 1
 MAX_SEQ_LEN = 2048
 BATCH_SIZE = 32
@@ -43,29 +35,33 @@ DATASET_SIZE = 50_000  # Subset of Ultrachat to use (None for full dataset)
 # ====================================
 
 
-def get_model_save_path(model_id: str) -> Path:
-    """Get path to save instruction-tuned model."""
-    model_name = model_id.split("/")[-1]
-    return MODELS_DIR / f"{model_name}_ultrachat"
+def format_ultrachat(example):
+    """Convert messages to prompt-completion format for completion_only_loss."""
+    messages = example["messages"]
+    # All messages except last are prompt, last assistant message is completion
+    return {
+        "prompt": messages[:-1],
+        "completion": [messages[-1]],
+    }
 
 
-def load_ultrachat(tokenizer, max_samples: int | None = None):
+def load_ultrachat(max_samples: int | None = None):
     """Load and prepare Ultrachat dataset."""
-    # HuggingFaceH4/ultrachat_200k has 'messages' field in OpenAI chat format
     dataset = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
     
     if max_samples:
         dataset = dataset.shuffle(seed=42).select(range(min(max_samples, len(dataset))))
     
+    dataset = dataset.map(format_ultrachat, remove_columns=dataset.column_names)
     return dataset
 
 
 def train_model(model_id: str):
     """Fine-tune a single model on Ultrachat."""
-    save_path = get_model_save_path(model_id)
+    out_dir = OUTPUT_DIR / model_id.split("/")[-1]
     
-    if save_path.exists():
-        print(f"Model already exists at {save_path}, skipping.")
+    if out_dir.exists():
+        print(f"Model already exists at {out_dir}, skipping.")
         return
     
     print(f"\n{'='*60}")
@@ -75,7 +71,7 @@ def train_model(model_id: str):
     tokenizer = load_tokenizer(model_id)
     
     # Load dataset
-    dataset = load_ultrachat(tokenizer, max_samples=DATASET_SIZE)
+    dataset = load_ultrachat(max_samples=DATASET_SIZE)
     print(f"Dataset size: {len(dataset)}")
     
     # Load model
@@ -92,9 +88,8 @@ def train_model(model_id: str):
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
     
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR / model_id.split("/")[-1]),
+    config = SFTConfig(
+        output_dir=str(out_dir),
         per_device_train_batch_size=MICRO_BATCH_SIZE,
         gradient_accumulation_steps=BATCH_SIZE // MICRO_BATCH_SIZE,
         num_train_epochs=NUM_EPOCHS,
@@ -108,26 +103,26 @@ def train_model(model_id: str):
         logging_steps=10,
         save_strategy="no",
         report_to="none",
+        max_length=MAX_SEQ_LEN,
+        completion_only_loss=True,
     )
     
-    # SFTTrainer handles chat template formatting automatically
     trainer = SFTTrainer(
         model=model,
-        args=training_args,
+        args=config,
         train_dataset=dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
-        max_seq_length=MAX_SEQ_LEN,
     )
     
     trainer.train()
     
     # Merge LoRA weights and save
-    print(f"Merging and saving model to {save_path}...")
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Merging and saving model to {out_dir}...")
+    out_dir.mkdir(parents=True, exist_ok=True)
     merged_model = trainer.model.merge_and_unload()
-    merged_model.save_pretrained(save_path)
-    print(f"Saved instruction-tuned model to {save_path}")
+    merged_model.save_pretrained(out_dir)
+    print(f"Saved instruction-tuned model to {out_dir}")
     
     del model, merged_model, trainer
     torch.cuda.empty_cache()
@@ -136,8 +131,6 @@ def train_model(model_id: str):
 def main():    
     torch.manual_seed(42)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    
     models_to_train = BASE_MODELS
     
     for model_id in models_to_train:
@@ -145,9 +138,7 @@ def main():
     
     print("\n" + "="*60)
     print("Instruction tuning complete!")
-    print("Models saved to:", MODELS_DIR)
-    print("\nTo run noise experiments, update MODELS in gsm8k_noise_run.py or arc_noise_run.py")
-    print("to point to these local model paths.")
+    print("Models saved to:", OUTPUT_DIR)
     print("="*60)
 
 
