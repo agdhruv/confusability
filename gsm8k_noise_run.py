@@ -25,13 +25,14 @@ from src.noise import number_perturbation
 from src.utils import load_model, load_tokenizer, to_lora
 
 # ============== CONFIG ==============
+# (model_id, use_chat_template, revision)
 MODELS = [
-    ("./results/alpaca_soup/Qwen2.5-0.5B/ingredient_0", False),
-    ("./results/alpaca_soup/Qwen2.5-0.5B/soup", False),
+    ("./results/rlvr_gsm8k/grpo_model", True, None),
+    ("./results/rlvr_gsm8k/sft_model", True, None),
 ]
 NOISE_LEVELS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-NUM_EPOCHS = 3
-OUTPUT_DIR = Path("./results/gsm8k_noise")
+NUM_EPOCHS = 1
+OUTPUT_DIR = Path("./results/gsm8k_noise_correct")
 MAX_SEQ_LEN = 512
 BATCH_SIZE = 64
 MICRO_BATCH_SIZE = 64
@@ -111,22 +112,38 @@ def prepare_noised_dataset(tokenizer, noise_level: float, use_chat_template: boo
 
     def tokenize(examples, indices):
         texts = []
+        prompts = []  # just the question part
         for idx, q, a in zip(indices, examples["question"], examples["answer"]):
             if idx in noise_indices:
                 a = number_perturbation(a, rng, scale=0.5)
             texts.append(format_example(tokenizer, q, a, use_chat_template))
+            # Get prompt length for masking
+            if use_chat_template:
+                prompts.append(tokenizer.apply_chat_template(
+                    [{"role": "user", "content": f"Question: {q}\nAnswer:"}],
+                    tokenize=False, add_generation_prompt=True
+                ))
+            else:
+                prompts.append(f"Question: {q}\nAnswer: ")
+        
         out = tokenizer(texts, truncation=True, max_length=MAX_SEQ_LEN, padding="max_length")
-        out["labels"] = out["input_ids"].copy()
+        prompt_lens = [len(tokenizer(p, add_special_tokens=False)["input_ids"]) for p in prompts]
+        
+        labels = []
+        for ids, plen in zip(out["input_ids"], prompt_lens):
+            lbl = [-100] * plen + list(ids[plen:])  # mask prompt tokens
+            labels.append(lbl)
+        out["labels"] = labels
         return out
 
     return train_ds.map(tokenize, batched=True, with_indices=True, remove_columns=train_ds.column_names)
 
 
-def load_lora_model(model_id: str):
+def load_lora_model(model_id: str, revision: str | None = None):
     """Load model with LoRA adapter."""
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
-    model = load_model(model_id, dtype)
-    print(f"Loaded model: {model_id} on device: {model.device}")
+    model = load_model(model_id, dtype, revision=revision)
+    print(f"Loaded model: {model_id} (rev={revision}) on device: {model.device}")
     return to_lora(model, checkpointing=True)
 
 
@@ -152,20 +169,24 @@ class EpochEvalCallback(TrainerCallback):
         self.epoch_results.append((epoch, acc, loss))
 
 
-def run_experiment(model_id: str, noise_level: float, use_chat_template: bool) -> list[ExperimentResult]:
+def run_experiment(model_id: str, noise_level: float, use_chat_template: bool, revision: str | None = None) -> list[ExperimentResult]:
     """Single experiment: train on noised data, evaluate after each epoch."""
+    # Create combined ID for tracking (includes revision suffix if present)
+    full_id = f"{model_id}_{revision}" if revision else model_id
+    label = full_id.split("/")[-1]
+    
     print(f"\n{'='*60}")
-    print(f"{model_id.split('/')[-1]} | noise={noise_level:.0%}")
+    print(f"{label} | noise={noise_level:.0%}")
     print(f"{'='*60}")
 
-    tokenizer = load_tokenizer(model_id)
-    model = load_lora_model(model_id)
+    tokenizer = load_tokenizer(model_id, revision=revision)
+    model = load_lora_model(model_id, revision=revision)
     train_dataset = prepare_noised_dataset(tokenizer, noise_level, use_chat_template)
     
     eval_callback = EpochEvalCallback(model, tokenizer, model_id, use_chat_template)
     
     args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR / f"{model_id.split('/')[-1]}_noise{noise_level:.2f}"),
+        output_dir=str(OUTPUT_DIR / f"{label}_noise{noise_level:.2f}"),
         per_device_train_batch_size=MICRO_BATCH_SIZE,
         gradient_accumulation_steps=BATCH_SIZE // MICRO_BATCH_SIZE,
         num_train_epochs=NUM_EPOCHS,
@@ -192,7 +213,7 @@ def run_experiment(model_id: str, noise_level: float, use_chat_template: bool) -
     # Convert callback results to ExperimentResults
     results = [
         ExperimentResult(
-            model_id=model_id,
+            model_id=full_id,
             noise_level=noise_level,
             epoch=epoch,
             post_train_accuracy=acc,
@@ -239,24 +260,25 @@ def main():
     
     results, completed = load_checkpoint()
 
-    for model_id, use_chat_template in MODELS:
+    for model_id, use_chat_template, revision in MODELS:
+        full_id = f"{model_id}_{revision}" if revision else model_id
         for noise_level in NOISE_LEVELS:
-            if (model_id, noise_level) in completed:
-                print(f"Skipping {model_id} @ {noise_level:.0%} (done)")
+            if (full_id, noise_level) in completed:
+                print(f"Skipping {full_id.split('/')[-1]} @ {noise_level:.0%} (done)")
                 continue
             
-            epoch_results = run_experiment(model_id, noise_level, use_chat_template)
+            epoch_results = run_experiment(model_id, noise_level, use_chat_template, revision)
             for r in epoch_results:
                 results.append(r.to_dict())
-            completed.add((model_id, noise_level))
+            completed.add((full_id, noise_level))
             save_checkpoint(results)
 
     # Final summary
     print(f"\n{'='*60}")
-    print(f"{'Model':<20} {'Noise':<8} {'Epoch':<6} {'Accuracy':<10}")
+    print(f"{'Model':<45} {'Noise':<8} {'Epoch':<6} {'Accuracy':<10}")
     print(f"{'-'*60}")
     for r in results:
-        print(f"{r['model_id'].split('/')[-1]:<20} {r['noise_level']:<8.0%} {r['epoch']:<6} {r['post_train_accuracy']:<10.2%}")
+        print(f"{r['model_label']:<45} {r['noise_level']:<8.0%} {r['epoch']:<6} {r['post_train_accuracy']:<10.2%}")
 
 
 if __name__ == "__main__":
