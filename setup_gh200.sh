@@ -13,4 +13,6 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu
 uv pip install datasets transformers trl lm-eval
 echo "Testing CUDA availability..."
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+git config --global user.email "dhruv_agarwal@live.com"
+git config --global user.name "Dhruv Agarwal"
 echo "Setup complete!"
