@@ -10,6 +10,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import argparse
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -21,18 +22,26 @@ from lm_eval.tasks import TaskManager
 from transformers import DataCollatorForLanguageModeling, Trainer, TrainerCallback, TrainingArguments
 
 from src.evals import InmemoryPeftLM
-from src.noise import number_perturbation
+from src.noise import systematic_offset, number_perturbation
 from src.utils import load_model, load_tokenizer, to_lora
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--clean_only", action="store_true", default=False)
+parser.add_argument("--noise_strategy", type=str, required=True, choices=["systematic_offset", "random_perturbation"])
+args = parser.parse_args()
 
 # ============== CONFIG ==============
 # (model_id, use_chat_template, revision)
 MODELS = [
-    ("./results/rlvr_gsm8k/grpo_model", True, None),
-    ("./results/rlvr_gsm8k/sft_model", True, None),
+    ("meta-llama/Llama-3.1-8B", False, None),
+    ("meta-llama/Llama-3.1-8B-Instruct", True, None),
 ]
+NOISE_STRATEGY = args.noise_strategy
 NOISE_LEVELS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+CLEAN_ONLY = args.clean_only  # Control experiment: train only on clean portion (remove noisy examples)
 NUM_EPOCHS = 1
-OUTPUT_DIR = Path("./results/gsm8k_noise_correct")
+_suffix = "_clean_only" if CLEAN_ONLY else ""
+OUTPUT_DIR = Path(f"./results/gsm8k_{NOISE_STRATEGY}{_suffix}")
 MAX_SEQ_LEN = 512
 BATCH_SIZE = 64
 MICRO_BATCH_SIZE = 64
@@ -110,12 +119,24 @@ def prepare_noised_dataset(tokenizer, noise_level: float, use_chat_template: boo
     n_noised = int(len(train_ds) * noise_level)
     noise_indices = set(rng.sample(range(len(train_ds)), n_noised)) if n_noised else set()
 
+    # Control experiment: train only on clean portion
+    if CLEAN_ONLY:
+        clean_indices = [i for i in range(len(train_ds)) if i not in noise_indices]
+        train_ds = train_ds.select(clean_indices)
+        noise_indices = set()  # No noise to apply anymore
+        print(f"CLEAN_ONLY: Training on {len(train_ds)} clean examples ({100*(1-noise_level):.0f}% of original)")
+
     def tokenize(examples, indices):
         texts = []
         prompts = []  # just the question part
         for idx, q, a in zip(indices, examples["question"], examples["answer"]):
             if idx in noise_indices:
-                a = number_perturbation(a, rng, scale=0.5)
+                if NOISE_STRATEGY == "systematic_offset":
+                    a = systematic_offset(a, offset=3.0)
+                elif NOISE_STRATEGY == "random_perturbation":
+                    a = number_perturbation(a, rng, scale=0.5)
+                else:
+                    raise ValueError(f"Invalid noise strategy: {NOISE_STRATEGY}")
             texts.append(format_example(tokenizer, q, a, use_chat_template))
             # Get prompt length for masking
             if use_chat_template:
@@ -265,6 +286,11 @@ def main():
         for noise_level in NOISE_LEVELS:
             if (full_id, noise_level) in completed:
                 print(f"Skipping {full_id.split('/')[-1]} @ {noise_level:.0%} (done)")
+                continue
+            
+            # Skip 100% noise in clean_only mode (no clean examples to train on)
+            if CLEAN_ONLY and noise_level == 1.0:
+                print(f"Skipping {full_id.split('/')[-1]} @ {noise_level:.0%} (no clean examples)")
                 continue
             
             epoch_results = run_experiment(model_id, noise_level, use_chat_template, revision)
